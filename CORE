@@ -1,0 +1,654 @@
+//+------------------------------------------------------------------+
+//|                                         Gold Scaling Project.mq5 |
+//|                                    Developed by Adam Murph, 2025 |
+//|                           Custom Expert Advisor for Scalping Use |
+//+------------------------------------------------------------------+
+#property copyright "Developed by Adam Murph, 2025"
+#property version   "1.00"
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+
+//--- General Settings
+input string   GoldScaling_Basic        = "=== BASIC SETTINGS ===";
+input int      MagicNumber           = 12345;
+input double   LotSize               = 0.01;
+input ENUM_TIMEFRAMES TimeFrame      = PERIOD_M5;
+
+//--- Strategy Settings
+input string   GoldScaling_Strategy     = "=== STRATEGY SETTINGS ===";
+input int      TakeProfitPoints      = 10000;   
+input int      StopLossPoints        = 9000;    
+input bool     UseTrailingStop       = true;
+input int      TrailingStopPoints    = 3000;
+input double   MonthlyTargetPercent  = 100.0;
+
+//--- Position Settings
+input string   GoldScaling_PositionMode = "=== POSITION SETTINGS ===";
+input bool     AllowHedging          = true;
+input bool     FreezeTradingFriday   = true;
+input int      FreezeHourFriday      = 17;      
+
+//--- VWAP Filter
+input string   GoldScaling_VWAP         = "=== VWAP SETTINGS ===";
+input bool     UseVWAPFilter         = true;
+
+//--- Misc
+input string   Notes                 = "EA Demo created based on client specification";
+
+//--- Pending Order Settings
+input int PendingDistancePoints = 6000; 
+input int MinUpdateInterval     = 30;
+input double priceGapThresholdPoints = 5;
+
+
+//=========GLOBAL========//
+datetime lastUpdateTime = 0;             
+double priceGapThreshold = 100 * _Point; 
+int handleFastMA, handleSlowMA;
+bool handlesInitialized = false;
+double initialMonthlyBalance;
+datetime lastCheckedMonth = -1;
+bool tradingStopped = false;
+
+
+//+------------------------------------------------------------------+
+//| Check if trading is allowed                                      |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed()
+{
+   datetime now = TimeCurrent();
+   MqlDateTime tm;
+   TimeToStruct(now, tm);
+
+   //--- Check if Friday freeze is enabled
+   if(FreezeTradingFriday && tm.day_of_week == 5 && tm.hour >= FreezeHourFriday)
+   {
+      Print("Trading is frozen on Friday after ", FreezeHourFriday, ":00");
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check if there are open positions                                |
+//+------------------------------------------------------------------+
+bool HasOpenPositions()
+{
+   return (PositionsTotal() > 0);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate VWAP (simple intraday)                                |
+//+------------------------------------------------------------------+
+double GetVWAP()
+{
+   datetime today = iTime(_Symbol, PERIOD_D1, 0);
+   double sumPV = 0.0;
+   double sumVolume = 0.0;
+
+   for(int i=0; i<Bars(_Symbol, _Period, today, TimeCurrent()); i++)
+   {
+      double typicalPrice = (iHigh(_Symbol, _Period, i) +
+                             iLow(_Symbol, _Period, i) +
+                             iClose(_Symbol, _Period, i)) / 3.0;
+      double volume = iVolume(_Symbol, _Period, i);
+      sumPV += typicalPrice * volume;
+      sumVolume += volume;
+   }
+   if(sumVolume == 0)
+      return iClose(_Symbol, _Period, 0);
+
+   return sumPV / sumVolume;
+}
+
+//+------------------------------------------------------------------+
+//| Trailing Stop function (based on input TrailingStopPoints)       |
+//+------------------------------------------------------------------+
+void CheckTrailingStop()
+{
+   if(!UseTrailingStop)
+      return;
+
+  for(int i = PositionsTotal() - 1; i >= 0; i--)
+{
+   string posSymbol = PositionGetSymbol(i);  // Ambil simbol dari posisi ke-i
+
+   if(!PositionSelect(posSymbol))
+      continue;
+
+   if(posSymbol != _Symbol)
+      continue;
+
+   long type          = PositionGetInteger(POSITION_TYPE);
+   double sl          = PositionGetDouble(POSITION_SL);
+   double tp          = PositionGetDouble(POSITION_TP);
+   double openPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
+   ulong ticket       = PositionGetInteger(POSITION_TICKET);
+   double priceCurrent = 0.0;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         SymbolInfoDouble(_Symbol, SYMBOL_BID, priceCurrent);
+         double newSL = priceCurrent - TrailingStopPoints * _Point;
+
+         // Hanya trailing jika sudah profit melebihi trailing stop
+         if(priceCurrent - openPrice > TrailingStopPoints * _Point && (sl < newSL || sl == 0))
+         {
+            if(trade.PositionModify(ticket, newSL, tp))
+               Print("🔃 Trailing Stop updated (BUY): ", DoubleToString(newSL, _Digits));
+            else
+               Print("❌ Gagal update SL Buy: ", GetLastError());
+         }
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         SymbolInfoDouble(_Symbol, SYMBOL_ASK, priceCurrent);
+         double newSL = priceCurrent + TrailingStopPoints * _Point;
+
+         if(openPrice - priceCurrent > TrailingStopPoints * _Point && (sl > newSL || sl == 0))
+         {
+            if(trade.PositionModify(ticket, newSL, tp))
+               Print("🔃 Trailing Stop updated (SELL): ", DoubleToString(newSL, _Digits));
+            else
+               Print("❌ Gagal update SL Sell: ", GetLastError());
+         }
+      }
+   }
+}
+
+
+//========================dual pending orders======================//
+bool HasPendingOrder(int type)
+{
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(OrderSelect(i))
+      {
+         if(OrderGetInteger(ORDER_TYPE) == type &&
+            OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED &&
+            OrderGetString(ORDER_SYMBOL) == _Symbol)
+         {
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//======================OrderNear======================//
+bool IsOrderNear(double price, ENUM_ORDER_TYPE orderType, double threshold)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderGetTicket(i))
+      {
+         if(OrderGetInteger(ORDER_TYPE) == orderType)
+         {
+            double existingPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+            if(MathAbs(price - existingPrice) < threshold)
+               return true; //on radius threshold
+         }
+      }
+   }
+   return false;
+}
+
+//=======================maxOrderAgeSeconds================//
+void CancelOldPendingOrders(int maxAgeSeconds)
+{
+   datetime now = TimeCurrent();
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i))
+      {
+         if(OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED &&
+            OrderGetString(ORDER_SYMBOL) == _Symbol)
+         {
+            datetime orderTime = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+            if((now - orderTime) > maxAgeSeconds)
+            {
+               ulong ticket = OrderGetInteger(ORDER_TICKET);
+               if(!trade.OrderDelete(ticket))
+               {
+                  PrintFormat("❌ Gagal hapus pending order #%d, Error: %d", ticket, GetLastError());
+               }
+               else
+               {
+                  PrintFormat("✅ Pending order #%d dihapus karena sudah lebih dari %d detik", ticket, maxAgeSeconds);
+               }
+            }
+         }
+      }
+   }
+}
+
+//====================filter spread======================//
+bool IsSpreadSafe()
+{
+   long spreadPoints;
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_SPREAD, spreadPoints))
+   {
+      Print("❌ Gagal mendapatkan spread.");
+      return false;
+   }
+
+   int maxAllowedSpread = 200; // contoh: batas 50 point (5 pip di 3-digit broker)
+
+   if(spreadPoints > maxAllowedSpread)
+   {
+      PrintFormat("⚠️ Spread terlalu tinggi: %d point", spreadPoints);
+      return false;
+   }
+
+   return true;
+}
+
+//===========================TargetPerMonthly=========================//
+void MonthlyTargetReached()
+{
+   // 1. Get the current date and extract the month number
+   MqlDateTime t;
+   TimeToStruct(TimeCurrent(), t);
+   int currentMonth = t.mon;
+
+   // 2. If month has changed, reset the initial monthly balance
+   if (currentMonth != lastCheckedMonth)
+   {
+      initialMonthlyBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      GlobalVariableSet("InitialMonthlyBalance", initialMonthlyBalance);
+      lastCheckedMonth = currentMonth;
+      tradingStopped = false; // Reset trading status for new month
+   }
+
+   // 3. Get current balance and the stored starting balance
+   double balanceNow = AccountInfoDouble(ACCOUNT_BALANCE);
+   double balanceStart;
+
+   if (!GlobalVariableGet("InitialMonthlyBalance", balanceStart))
+   {
+      // If failed to get it, use current balance as fallback
+      balanceStart = balanceNow;
+      GlobalVariableSet("InitialMonthlyBalance", balanceStart);
+   }
+
+   // 4. Calculate the monthly return in percent
+   double percentGain = ((balanceNow - balanceStart) / balanceStart) * 100.0;
+
+   // 5. Check if target is reached
+   if (percentGain >= MonthlyTargetPercent && !tradingStopped)
+   {
+      Print("✅ Monthly target reached: ", DoubleToString(percentGain, 2), "%");
+
+      // Optional: stop trading after reaching target
+      tradingStopped = true;
+   }
+}
+
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+
+   // --- Hitung ulang threshold jarak harga untuk pending order
+   priceGapThreshold = priceGapThresholdPoints * _Point;
+
+   // --- Tampilkan info saat inisialisasi
+   Print("📢 EA Gold Scaling Project telah diinisialisasi.");
+   PrintFormat("🔧 Threshold Jarak Harga: %.5f", priceGapThreshold);
+   PrintFormat("📊 VWAP Filter Aktif: %s", (UseVWAPFilter ? "Ya" : "Tidak"));
+   PrintFormat("📈 MA Filter Aktif: EMA 20 / EMA 50");
+
+   return(INIT_SUCCEEDED);
+}
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("Gold Scaling Project Deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // === Filter MA ===
+   bool allowBuy = true, allowSell = true;
+   GetMAFilter(allowBuy, allowSell);
+
+   // === Cek izin trading
+   if(!IsTradingAllowed())
+   {
+      Print("🚫 Trading tidak diizinkan saat ini.");
+      return;
+   }
+
+   // === Cek Spread
+   if(!IsSpreadSafe())
+   {
+      Print("⚠️ Spread tidak aman - lewati eksekusi EA.");
+      return;
+   }
+
+   // === Cek VWAP jika aktif
+   if(UseVWAPFilter)
+   {
+      double vwap = GetVWAP();
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(price < vwap)
+      {
+         Print("⚠️ Harga di bawah VWAP - lewati entry.");
+         return;
+      }
+   }
+
+   // === Cek Target Bulanan
+   MonthlyTargetReached();
+   if(tradingStopped)
+   {
+      Print("🚫 Trading dihentikan karena target bulanan tercapai.");
+      return;
+   }
+
+   // === Update interval kontrol
+   datetime now = TimeCurrent();
+   if(now - lastUpdateTime >= MinUpdateInterval)
+   {
+      lastUpdateTime = now;
+      PrintFormat("🕒 UpdatePendingOrders() dijalankan pada %s", TimeToString(now, TIME_DATE | TIME_SECONDS));
+
+      CleanupAndSetPendingOrders();
+
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      // Perbedaan untuk order kedua (offset 2 pips)
+      double offset = 20 * _Point;
+
+      // === BUY STOP 1 & 2
+      double buyStopPrice1 = NormalizeDouble(ask + PendingDistancePoints * _Point, _Digits);
+      double buyStopPrice2 = NormalizeDouble(buyStopPrice1 + offset, _Digits);
+
+      if(allowBuy && !IsOrderNear(buyStopPrice1, ORDER_TYPE_BUY_STOP, priceGapThreshold))
+      {
+         trade.BuyStop(LotSize, buyStopPrice1, _Symbol,
+                       buyStopPrice1 - StopLossPoints * _Point,
+                       buyStopPrice1 + TakeProfitPoints * _Point,
+                       0, "GoldFish Buy 1");
+      }
+
+      if(allowBuy && !IsOrderNear(buyStopPrice2, ORDER_TYPE_BUY_STOP, priceGapThreshold))
+      {
+         trade.BuyStop(LotSize, buyStopPrice2, _Symbol,
+                       buyStopPrice2 - StopLossPoints * _Point,
+                       buyStopPrice2 + TakeProfitPoints * _Point,
+                       0, "GoldFish Buy 2");
+      }
+
+      // === SELL STOP 1 & 2
+      double sellStopPrice1 = NormalizeDouble(bid - PendingDistancePoints * _Point, _Digits);
+      double sellStopPrice2 = NormalizeDouble(sellStopPrice1 - offset, _Digits);
+
+      if(allowSell && !IsOrderNear(sellStopPrice1, ORDER_TYPE_SELL_STOP, priceGapThreshold))
+      {
+         trade.SellStop(LotSize, sellStopPrice1, _Symbol,
+                        sellStopPrice1 + StopLossPoints * _Point,
+                        sellStopPrice1 - TakeProfitPoints * _Point,
+                        0, "GoldFish Sell 1");
+      }
+
+      if(allowSell && !IsOrderNear(sellStopPrice2, ORDER_TYPE_SELL_STOP, priceGapThreshold))
+      {
+         trade.SellStop(LotSize, sellStopPrice2, _Symbol,
+                        sellStopPrice2 + StopLossPoints * _Point,
+                        sellStopPrice2 - TakeProfitPoints * _Point,
+                        0, "GoldFish Sell 2");
+      }
+   }
+   else
+   {
+      int sisa = (int)(MinUpdateInterval - (now - lastUpdateTime));
+      PrintFormat("⏳ Belum saatnya update order. %d detik tersisa.", sisa);
+   }
+
+   // === Trailing stop
+   CheckTrailingStop();
+}
+
+//===============================ActiveOrders===========================//
+bool HasActiveOrders()
+{
+   //--- Check positions (market orders)
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      string sym = PositionGetSymbol(i);
+      if(sym == _Symbol)
+         return true;
+   }
+
+   //--- Check pending orders
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(OrderSelect(i))  // MQL5 style
+      {
+         string symOrder = OrderGetString(ORDER_SYMBOL);
+         if(symOrder == _Symbol)
+            return true;
+      }
+   }
+   return false;
+}
+
+//===========================pendings order======================//
+void DeleteOldPendingOrders()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i))
+      {
+         string symOrder = OrderGetString(ORDER_SYMBOL);
+         int type        = (int)OrderGetInteger(ORDER_TYPE);
+         int magic       = (int)OrderGetInteger(ORDER_MAGIC);
+
+         if(symOrder == _Symbol && (type == ORDER_TYPE_SELL_STOP || type == ORDER_TYPE_BUY_STOP))
+         {
+            ulong ticket = OrderGetInteger(ORDER_TICKET);
+            PrintFormat("Deleting order #%d | Type: %s | Magic: %d", ticket, EnumToString((ENUM_ORDER_TYPE)type), magic);
+
+            if(!trade.OrderDelete(ticket))
+               PrintFormat("❌ Failed to delete order #%d | Error: %d", ticket, GetLastError());
+            else
+               PrintFormat("✅ Deleted order #%d", ticket);
+         }
+      }
+   }
+}
+
+// === Filter Berdasarkan MA (tanpa digambar dan tanpa input) ===
+void GetMAFilter(bool &allowBuy, bool &allowSell)
+{
+   double bufferFast[1], bufferSlow[1];
+   int handleFast = iMA(_Symbol, _Period, 20, 0, MODE_EMA, PRICE_CLOSE);
+   int handleSlow = iMA(_Symbol, _Period, 50, 0, MODE_EMA, PRICE_CLOSE);
+
+   allowBuy = true;
+   allowSell = true;
+
+   if(handleFast != INVALID_HANDLE && handleSlow != INVALID_HANDLE)
+   {
+      if(CopyBuffer(handleFast, 0, 0, 1, bufferFast) > 0 &&
+         CopyBuffer(handleSlow, 0, 0, 1, bufferSlow) > 0)
+      {
+         allowBuy  = bufferFast[0] > bufferSlow[0];
+         allowSell = bufferFast[0] < bufferSlow[0];
+      }
+   }
+
+   IndicatorRelease(handleFast);
+   IndicatorRelease(handleSlow);
+}
+
+//=========================update pending orders==================//
+void UpdatePendingOrders()
+{
+   double priceAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double priceBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   double expectedBuyStop  = NormalizeDouble(priceAsk + PendingDistancePoints * _Point, _Digits);
+   double expectedSellStop = NormalizeDouble(priceBid - PendingDistancePoints * _Point, _Digits);
+
+   ulong  buyTicket  = 0;
+   ulong  sellTicket = 0;
+   double buyPrice   = 0.0;
+   double sellPrice  = 0.0;
+
+   int totalPendingBuy  = 0;
+   int totalPendingSell = 0;
+
+   // === MA Filter (gunakan fungsi GetMAFilter)
+   bool allowBuy, allowSell;
+   GetMAFilter(allowBuy, allowSell);  // <-- Fungsi ini kamu harus punya di luar OnTick/Update
+
+   // === Scan existing pending orders
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i))
+      {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+            OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED)
+         {
+            int type = (int)OrderGetInteger(ORDER_TYPE);
+            double price = OrderGetDouble(ORDER_PRICE_OPEN);
+            ulong ticket = OrderGetInteger(ORDER_TICKET);
+
+            if(type == ORDER_TYPE_BUY_STOP)
+            {
+               buyTicket = ticket;
+               buyPrice = price;
+               totalPendingBuy++;
+            }
+            else if(type == ORDER_TYPE_SELL_STOP)
+            {
+               sellTicket = ticket;
+               sellPrice = price;
+               totalPendingSell++;
+            }
+         }
+      }
+   }
+
+   // === BUY STOP ===
+   if(buyTicket != 0)
+   {
+      double buyGap = MathAbs(buyPrice - expectedBuyStop);
+      if(buyGap > priceGapThreshold)
+      {
+         if(trade.OrderDelete(buyTicket))
+            PrintFormat("✅ Old Buy Stop %.2f deleted (gap=%.2f)", buyPrice, buyGap);
+         else
+            PrintFormat("❌ Gagal hapus Buy Stop #%d, error %d", buyTicket, GetLastError());
+         buyTicket = 0;
+      }
+      else
+      {
+         PrintFormat("ℹ️ Buy Stop %.2f masih valid (gap=%.2f), tidak update.", buyPrice, buyGap);
+      }
+   }
+
+   if(buyTicket == 0 && totalPendingBuy < 1 && allowBuy)
+   {
+      double sl = NormalizeDouble(expectedBuyStop - StopLossPoints * _Point, _Digits);
+      double tp = NormalizeDouble(expectedBuyStop + TakeProfitPoints * _Point, _Digits);
+
+      if(trade.BuyStop(LotSize, expectedBuyStop, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "GoldFish Buy Stop"))
+      {
+         PrintFormat("✅ Placed new Buy Stop at %.2f", expectedBuyStop);
+      }
+      else
+      {
+         PrintFormat("❌ Gagal place Buy Stop, error %d", GetLastError());
+      }
+   }
+
+   // === SELL STOP ===
+   if(sellTicket != 0)
+   {
+      double sellGap = MathAbs(sellPrice - expectedSellStop);
+      if(sellGap > priceGapThreshold)
+      {
+         if(trade.OrderDelete(sellTicket))
+            PrintFormat("✅ Old Sell Stop %.2f deleted (gap=%.2f)", sellPrice, sellGap);
+         else
+            PrintFormat("❌ Gagal hapus Sell Stop #%d, error %d", sellTicket, GetLastError());
+         sellTicket = 0;
+      }
+      else
+      {
+         PrintFormat("ℹ️ Sell Stop %.2f masih valid (gap=%.2f), tidak update.", sellPrice, sellGap);
+      }
+   }
+
+   if(sellTicket == 0 && totalPendingSell < 1 && allowSell)
+   {
+      double sl = NormalizeDouble(expectedSellStop + StopLossPoints * _Point, _Digits);
+      double tp = NormalizeDouble(expectedSellStop - TakeProfitPoints * _Point, _Digits);
+
+      if(trade.SellStop(LotSize, expectedSellStop, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "GoldFish Sell Stop"))
+      {
+         PrintFormat("✅ Placed new Sell Stop at %.2f", expectedSellStop);
+      }
+      else
+      {
+         PrintFormat("❌ Gagal place Sell Stop, error %d", GetLastError());
+      }
+   }
+}
+
+void CleanupAndSetPendingOrders()
+{
+   double priceAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double priceBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   double buyPrice  = NormalizeDouble(priceAsk + PendingDistancePoints * _Point, _Digits);
+   double sellPrice = NormalizeDouble(priceBid - PendingDistancePoints * _Point, _Digits);
+   
+   // 🔁 Hapus semua pending order lama di simbol ini
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(OrderSelect(ticket))
+      {
+         string symb = OrderGetString(ORDER_SYMBOL);
+         int    type = (int)OrderGetInteger(ORDER_TYPE);
+         int    state = (int)OrderGetInteger(ORDER_STATE);
+         
+         // Hanya hapus order yang pending, aktif, dan milik simbol ini
+         if(symb == _Symbol && state == ORDER_STATE_PLACED &&
+            (type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_SELL_STOP))
+         {
+            if(trade.OrderDelete(ticket))
+               Print("✅ Pending order dihapus: ", ticket);
+            else
+               Print("❌ Gagal hapus order ", ticket, " error: ", GetLastError());
+         }
+      }
+   }
+   
+   // ✅ Pasang 1 Buy Stop
+   trade.BuyStop(LotSize, buyPrice, NULL,
+                 buyPrice - StopLossPoints * _Point,
+                 buyPrice + TakeProfitPoints * _Point,
+                 ORDER_TIME_GTC, 0, "Auto Buy Stop");
+
+   // ✅ Pasang 1 Sell Stop
+   trade.SellStop(LotSize, sellPrice, NULL,
+                  sellPrice + StopLossPoints * _Point,
+                  sellPrice - TakeProfitPoints * _Point,
+                  ORDER_TIME_GTC, 0, "Auto Sell Stop");
+}
